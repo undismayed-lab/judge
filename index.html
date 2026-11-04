@@ -344,7 +344,7 @@ tr:last-child td{border-bottom:0}
     <form class="entry-form" id="entry-form" novalidate>
       <div class="field">
         <label for="judge-name">심사위원 이름</label>
-        <input id="judge-name" class="pill-input glass" maxlength="12" autocomplete="nickname" placeholder="이름 또는 별명">
+        <input id="judge-name" class="pill-input glass" maxlength="64" autocomplete="nickname" placeholder="이름 또는 별명">
       </div>
       <button class="btn-metal" type="submit">입장</button>
       <p class="err" id="entry-err" role="alert" hidden></p>
@@ -446,7 +446,41 @@ const MEDAL = ['금메달', '은메달', '동메달'];
 const METAL_OF = ['gold', 'silver', 'bronze'];
 const byId = id => SONGS.find(s => s.id === id);
 const $ = s => document.querySelector(s);
-const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* @pure-begin: DOM-free logic, loaded by tests/scoring.test.js */
+const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* A ballot must rank every song exactly once. Accepts numeric strings ("2") because sheet round-trips may stringify ids.
+   Returns the normalized id array, or null for anything else (duplicates, unknown ids, wrong length). */
+function normRanks(ranks, ids){
+  if (!Array.isArray(ranks) || ranks.length !== ids.length) return null;
+  const out = ranks.map(v => (typeof v === 'number' || (typeof v === 'string' && /^\d+$/.test(v.trim()))) ? Number(v) : NaN);
+  if (!out.every(v => ids.includes(v)) || new Set(out).size !== ids.length) return null;
+  return out;
+}
+/* Review text from the server may be any JSON value; only strings are shown */
+const reviewText = v => typeof v === 'string' ? v.trim() : '';
+/* Medal points: 1st = N, 2nd = N-1, ... (N = number of songs; 3/2/1 for three songs).
+   Order: points, then number of golds, then average rank. Equal entries share a rank (1, 1, 3). */
+function tally(rows, ids){
+  const N = ids.length;
+  const submissions = (Array.isArray(rows) ? rows : []).map(r => {
+    const ranks = r && normRanks(r.ranks, ids);
+    if (!ranks) return null;
+    const reviews = r.reviews && typeof r.reviews === 'object' ? r.reviews : {};
+    return { name: String(r.name == null ? '' : r.name), ranks, reviews, at: new Date(r.at) };
+  }).filter(Boolean);
+  const n = submissions.length;
+  const stats = ids.map(id => {
+    const ranks = submissions.map(sub => sub.ranks.indexOf(id) + 1);
+    return { id, pts: ranks.reduce((a, r) => a + (N + 1 - r), 0), firsts: ranks.filter(r => r === 1).length,
+      avg: n ? ranks.reduce((a, r) => a + r, 0) / n : 0 };
+  }).sort((a, b) => b.pts - a.pts || b.firsts - a.firsts || a.avg - b.avg);
+  const same = (a, b) => a.pts === b.pts && a.firsts === b.firsts && a.avg === b.avg;
+  stats.forEach((st, i) => st.rank = (i && same(st, stats[i-1])) ? stats[i-1].rank : i + 1);
+  return { submissions, stats };
+}
+/* @pure-end */
+const SONG_IDS = SONGS.map(s => s.id);
+const NAME_MAX = 12;                            // 심사위원 이름 최대 글자 수
 const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const state = { name:'', order:[], cardOrder:[], assign:{}, reviews:{1:'',2:'',3:''}, screen:'s-entry', dissolve:null, entryFade:false };
@@ -1215,15 +1249,20 @@ $('#entry-form').addEventListener('submit', e => {
   e.preventDefault();
   const name = $('#judge-name').value.trim();
   if (name.startsWith('/')) { openResults(name); return; }
-  $('#entry-err').textContent = '이름을 입력해야 입장할 수 있습니다.';
-  $('#entry-err').hidden = !!name;
-  if (!name) { $('#judge-name').focus(); return; }
+  // 입력 칸은 주최자 명령을 위해 길게 받고, 심사위원 이름만 NAME_MAX자로 제한한다
+  const tooLong = name.length > NAME_MAX;            // 예전 maxlength="12"와 같은 기준(UTF-16 길이)
+  $('#entry-err').textContent = tooLong ? `이름은 ${NAME_MAX}자까지 쓸 수 있습니다.` : '이름을 입력해야 입장할 수 있습니다.';
+  $('#entry-err').hidden = !!name && !tooLong;
+  if (!name || tooLong) { $('#judge-name').focus(); return; }
   const saved = loadMine();
-  const prevSub = !state.cardOrder.length && saved && saved.name === name && Array.isArray(saved.ranks) && saved.ranks.length === 3 ? saved : null;
+  const savedRanks = saved && saved.name === name ? normRanks(saved.ranks, SONG_IDS) : null;
+  const prevSub = !state.cardOrder.length && savedRanks ? saved : null;
   if (prevSub){                                   // 이 기기에서 같은 이름으로 낸 심사가 있으면 이어서 고친다
-    state.cardOrder = prevSub.ranks.slice();
-    state.assign = {}; prevSub.ranks.forEach((id, i) => state.assign[id] = i + 1);
-    state.order = prevSub.ranks.slice(); state.reviews = {1:'',2:'',3:'', ...prevSub.reviews};
+    state.cardOrder = savedRanks.slice();
+    state.assign = {}; savedRanks.forEach((id, i) => state.assign[id] = i + 1);
+    state.order = savedRanks.slice();
+    state.reviews = {1:'',2:'',3:''};
+    SONG_IDS.forEach(id => { const v = prevSub.reviews && prevSub.reviews[id]; if (typeof v === 'string') state.reviews[id] = v; });
   }
   else if (!state.cardOrder.length){ state.cardOrder = shuffle(SONGS.map(s => s.id)); state.assign = {}; state.order = []; state.reviews = {1:'',2:'',3:''}; }
   state.name = name; $('#plaque-name').textContent = name;
@@ -1446,17 +1485,10 @@ async function openResults(cmd){
 }
 $('#res-close').addEventListener('click', () => show('s-entry'));
 function renderResults(rows){
-  const submissions = rows.filter(r => Array.isArray(r.ranks) && r.ranks.length === 3 && r.ranks.every(id => byId(id))).map(r => ({...r, at: new Date(r.at), reviews: r.reviews || {}}));
-  const n = submissions.length;
+  const t = tally(rows, SONG_IDS), submissions = t.submissions, n = submissions.length;
+  const stats = t.stats.map(st => ({...st, song: byId(st.id)}));
   $('#res-count').textContent = `심사위원 ${n}명`;
   $('#res-empty').hidden = n > 0;
-  const stats = SONGS.map(s => {
-    const ranks = submissions.map(sub => sub.ranks.indexOf(s.id) + 1);
-    return { song: s, pts: ranks.reduce((a, r) => a + (4 - r), 0), firsts: ranks.filter(r => r === 1).length,
-      avg: ranks.reduce((a, r) => a + r, 0) / (n || 1) };
-  }).sort((a, b) => b.pts - a.pts || b.firsts - a.firsts || a.avg - b.avg);
-  const same = (a, b) => a.pts === b.pts && a.firsts === b.firsts && a.avg === b.avg;
-  stats.forEach((st, i) => st.rank = (i && same(st, stats[i-1])) ? stats[i-1].rank : i + 1);
   renderPodium($('#res-podium'), stats);
   $('#res-table').innerHTML = `<thead><tr><th>순위</th><th>곡</th><th class="num">총점</th><th class="num">금메달</th><th class="num">평균</th></tr></thead><tbody>` +
     stats.map(st => `<tr><td class="rk">${stats.filter(x => x.rank === st.rank).length > 1 ? '공동 ' : ''}${st.rank}위</td>
@@ -1467,7 +1499,7 @@ function renderResults(rows){
     <article class="jcard glass">
       <header><h3>${esc(sub.name)}</h3><time>${isNaN(sub.at) ? '' : df(sub.at)}</time></header>
       <ol class="jlist">${sub.ranks.map((id, i) => {
-        const r = (sub.reviews[id] || '').trim();
+        const r = reviewText(sub.reviews[id]);
         return `<li>${medalHTML(i+1, 'sm', false)}<div><span class="t">${byId(id).title}</span>${r ? `<p>${esc(r)}</p>` : '<p class="none">심사평 없음</p>'}</div></li>`;
       }).join('')}</ol>
     </article>`).join('');
